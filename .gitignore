@@ -1,3 +1,4 @@
+# 通用编译产物忽略（远程仓库默认项，保留）
 # Prerequisites
 *.d
 
@@ -39,3 +40,15 @@
 
 # debug information files
 *.dwo
+
+# PlatformIO 专属忽略（本地项，保留）
+.pio/
+.pioenvs/
+.piolibdeps/
+.clang_complete
+.gcc-flags.json
+.vscode/
+
+# 系统/日志文件
+.DS_Store
+*.log
