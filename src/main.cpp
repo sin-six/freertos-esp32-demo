@@ -7,9 +7,13 @@
 #include <PubSubClient.h>
 #include <Adafruit_BMP280.h>
 #include <Wire.h>
-#include <WebServer.h>
+#include "esp_pm.h"
+#include "esp_sleep.h"
+
 
 #define DEBUG 1
+#define SLEEP_MODE 0 // 0: 不睡眠，1: 轻睡眠
+
 
 #define I2C_SDA_PIN 4
 #define I2C_SCL_PIN 5
@@ -31,7 +35,7 @@ const char *password = "interesting";
 const char *mqtt_server = "192.168.137.1";
 const int mqtt_port = 1883;
 
-//目前没用上
+// ===================== 目前没用上 =====================
 const char *mqtt_user = "esp32_user";
 const char *mqtt_pwd = "esp32_123456";
 
@@ -118,7 +122,6 @@ void mqtt_connect()
   if(client.connected())
     return;
 
-  randomSeed(analogRead(0));
 
   static uint32_t last_retry = 0;
   if(millis() - last_retry < 3000)
@@ -127,7 +130,7 @@ void mqtt_connect()
   last_retry = millis();
 
   String client_id = "ESP32Client-";
-  client_id += String(random(0xffff), HEX);
+  client_id += String(esp_random(), HEX);
 
   safe_printf("MQTT connecting...\n");
   if (client.connect(client_id.c_str()))
@@ -158,11 +161,11 @@ void sensor_task(void *pvParameters)
   safe_printf("AHT10/AHT20 Found!\n");
 
   aht_temp = aht.getTemperatureSensor();
-#ifdef DEBUG
+#if DEBUG
   aht_temp->printSensorDetails();
 #endif
   aht_humidity = aht.getHumiditySensor();
-#ifdef DEBUG
+#if DEBUG
   aht_humidity->printSensorDetails();
 #endif
 
@@ -186,7 +189,7 @@ void sensor_task(void *pvParameters)
                   Adafruit_BMP280::SAMPLING_X16,    /* Pressure oversampling */
                   Adafruit_BMP280::FILTER_X16,      /* Filtering. */
                   Adafruit_BMP280::STANDBY_MS_500); /* Standby time. */
-#ifdef DEBUG
+#if DEBUG
   bmp_temp->printSensorDetails();
 #endif
   
@@ -233,7 +236,7 @@ void mqtt_task(void *pvParameters)
     mqtt_connect();
     client.loop();
 
-    if (xQueueReceive(data_queue, &data, pdMS_TO_TICKS(100)) == pdPASS)
+    if (xQueueReceive(data_queue, &data, pdMS_TO_TICKS(5000)) == pdPASS)
     {
       // 温湿度格式化打印
       safe_printf("\t\tmqtt_Temperature %.2f deg C\n", data.temperature);
@@ -252,6 +255,18 @@ void mqtt_task(void *pvParameters)
 void setup() {
   Serial.begin(115200);
   while(!Serial) delay(10);
+
+#if SLEEP_MODE 
+  esp_pm_config_esp32c3_t pm_config = {
+    .max_freq_mhz = 160,
+    .min_freq_mhz = 20,
+    .light_sleep_enable = true
+  };
+  if(esp_pm_configure(&pm_config) != ESP_OK ) {
+    safe_printf("Failed to configure power management\n");
+  }
+#endif 
+ 
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN); // 初始化I2C总线
 
@@ -279,7 +294,7 @@ void setup() {
       "MQTT_Task", // 任务名称
       4096,         // 栈大小
       NULL,         // 参数
-      10,            // 优先级
+      8,            // 优先级
       NULL          // 句柄
   );
 
