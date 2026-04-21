@@ -10,6 +10,13 @@
 #include "esp_pm.h"
 #include "esp_sleep.h"
 #include <ArduinoOTA.h>
+#include <lvgl.h>
+#include "cst816t.h" // capacitive touch
+#include <TFT_eSPI.h>
+
+// 添加 GUI-Guider 生成的头文件
+#include "gui_guider.h"
+#include "events_init.h"
 
 #define DEBUG 1
 #define SLEEP_MODE 0 // 0: 不睡眠，1: 轻睡眠
@@ -18,6 +25,16 @@
 #define I2C_SDA_PIN 4
 #define I2C_SCL_PIN 5
 
+#define TP_SDA 4
+#define TP_SCL 5
+#define TP_RST 8
+#define TP_IRQ 9
+
+#define TFT_BL 2
+#define TFT_BACKLIGHT_ON HIGH
+
+#define SCREEN_WIDTH 240
+#define SCREEN_HEIGHT 280
 
 typedef struct{
   float temperature; // AHT20温度
@@ -56,12 +73,27 @@ SemaphoreHandle_t i2c_mutex; // I2C总线互斥锁
 // ===================== 串口互斥锁 =====================
 SemaphoreHandle_t serial_mutex;
 
+// ===================== WiFi互斥锁 =====================
+SemaphoreHandle_t wifi_mutex;
+
 QueueHandle_t data_queue; // 传感器数据队列
+QueueHandle_t ui_queue;// UI更新队列
 
 // ===================== MQTT客户端 =====================
 WiFiClient espClient;
 PubSubClient client(espClient);
 
+// ===================== 触摸全局结构体 =====================
+cst816t touch(Wire, TP_RST, TP_IRQ);
+
+TFT_eSPI tft = TFT_eSPI();
+lv_ui guider_ui;
+
+// 原始坐标范围（需要根据实际触摸屏校准后确定）
+#define RAW_X_MIN 200  // 左上角 X 最小值
+#define RAW_X_MAX 3950 // 右下角 X 最大值
+#define RAW_Y_MIN 150  // 左上角 Y 最小值
+#define RAW_Y_MAX 3850 // 右下角 Y 最大值
 
 void safe_printf(const char *format, ...)
 {
@@ -78,39 +110,45 @@ void safe_printf(const char *format, ...)
   vsnprintf(buffer, sizeof(buffer), format, args);
   va_end(args);
 
-  // 4. 打印输出
   Serial.print(buffer);
 
-  // 5. 解锁
   xSemaphoreGive(serial_mutex);
 }
 
 void wifi_connect()
 {
-  if (WiFi.status() == WL_CONNECTED)
-    return;
-  safe_printf("WiFi linking...\n");
-  WiFi.begin(ssid, password);
+  if (xSemaphoreTake(wifi_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+  {
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      xSemaphoreGive(wifi_mutex); 
+      return;
+    }
+    safe_printf("WiFi linking...\n");
+     WiFi.begin(ssid, password);
 
   // 最多等 10 秒，超时就退出，不卡死系统
-  char wifi_status = 0;
-  while (WiFi.status() != WL_CONNECTED && wifi_status < 100)
-  {
-    vTaskDelay(pdMS_TO_TICKS(100)); // 延迟100毫秒，避免过多输出
-    safe_printf(".");
-    wifi_status++;
-  }
+    char wifi_status = 0;
+    while (WiFi.status() != WL_CONNECTED && wifi_status < 100)
+   {
+      vTaskDelay(pdMS_TO_TICKS(100)); // 延迟100毫秒，避免过多输出
+      safe_printf(".");
+      wifi_status++;
+   }
 
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    safe_printf("\nWiFi connected!\n");
-    safe_printf("IP address: %s\n", WiFi.localIP().toString().c_str());
+   if (WiFi.status() == WL_CONNECTED)
+   {
+     safe_printf("\nWiFi connected!\n");
+      safe_printf("IP address: %s\n", WiFi.localIP().toString().c_str());
 #if SLEEP_MODE
-    WiFi.setSleep(true);
-    safe_printf("WiFi sleep enabled\n");
+     WiFi.setSleep(true);
+     safe_printf("WiFi sleep enabled\n");
 #endif
-  }else{
-    safe_printf("\nWiFi connect failed!\n");
+    }else{
+      safe_printf("\nWiFi connect failed!\n");
+    }
+
+  xSemaphoreGive(wifi_mutex);
   }
 }
 
@@ -146,6 +184,47 @@ void mqtt_connect()
   }
 }
 
+// ===================== LVGL显示刷新回调 =====================
+void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p)
+{
+  uint32_t w = (area->x2 - area->x1 + 1);
+  uint32_t h = (area->y2 - area->y1 + 1);
+  tft.startWrite();
+  tft.setAddrWindow(area->x1, area->y1, w, h);
+  tft.pushColors((uint16_t *)&color_p->full, w * h, true);
+  tft.endWrite();
+  lv_disp_flush_ready(disp);
+}
+
+// 触摸读取回调
+// ========== 触摸读取回调 ==========
+void my_touchpad_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
+{
+  xSemaphoreTake(i2c_mutex, portMAX_DELAY);
+  bool touched = touch.available();
+  if (touched)
+  {
+    // 临时打印原始坐标（调试用）
+    safe_printf("raw: x=%d, y=%d\n", touch.x, touch.y);
+
+    // 线性映射到屏幕分辨率
+    data->point.x = map(touch.x, RAW_X_MIN, RAW_X_MAX, 0, SCREEN_WIDTH - 1);
+    data->point.y = map(touch.y, RAW_Y_MIN, RAW_Y_MAX, 0, SCREEN_HEIGHT - 1);
+
+    // 边界裁剪，防止超出屏幕范围
+    if (data->point.x >= SCREEN_WIDTH)
+      data->point.x = SCREEN_WIDTH - 1;
+    if (data->point.y >= SCREEN_HEIGHT)
+      data->point.y = SCREEN_HEIGHT - 1;
+
+    data->state = LV_INDEV_STATE_PR;
+  }
+  else
+  {
+    data->state = LV_INDEV_STATE_REL;
+  }
+  xSemaphoreGive(i2c_mutex);
+}
 
 // ===================== 传感器任务 =====================
 void sensor_task(void *pvParameters)
@@ -240,6 +319,7 @@ void sensor_task(void *pvParameters)
     data.bmp_temperature = bmp280_temp_event.temperature;
 
     xQueueSend(data_queue, &data, portMAX_DELAY); // 发送数据到队列
+    xQueueOverwrite(ui_queue, &data); // 发送数据到 UI 队列，覆盖之前的数据
 
     // 温湿度格式化打印
     safe_printf("\t\tTemperature %.2f deg C\n", data.temperature);
@@ -319,6 +399,75 @@ void mqtt_task(void *pvParameters)
   }
 }
 
+void ui_lvgl_task(void *pvParameters)
+{
+  // 这里可以添加LVGL的UI更新代码
+  // 屏幕初始化
+  tft.begin();
+  tft.setRotation(0);
+
+  // pinMode(TFT_BL, OUTPUT);
+  // digitalWrite(TFT_BL, HIGH);
+
+  ledcSetup(0, 5000, 8); // 通道0，频率5kHz，分辨率8位
+  ledcAttachPin(TFT_BL, 0); // 将TFT_BL引脚
+  ledcWrite(0, 255); // 设置亮度为最大值
+
+  touch.begin(mode_change);
+
+  lv_init();
+
+  // 分配显示缓冲区（一行或多行）
+  static lv_disp_draw_buf_t draw_buf;
+  static lv_color_t buf[SCREEN_WIDTH * 10]; // 10 行缓冲区
+  lv_disp_draw_buf_init(&draw_buf, buf, NULL, SCREEN_WIDTH * 10);
+
+  // 注册显示驱动
+  static lv_disp_drv_t disp_drv;
+  lv_disp_drv_init(&disp_drv);
+  disp_drv.draw_buf = &draw_buf;
+  disp_drv.flush_cb = my_disp_flush;
+  disp_drv.hor_res = SCREEN_WIDTH;
+  disp_drv.ver_res = SCREEN_HEIGHT;
+  lv_disp_drv_register(&disp_drv);
+
+  // 注册触摸输入
+  static lv_indev_drv_t indev_drv;
+  lv_indev_drv_init(&indev_drv);
+  indev_drv.type = LV_INDEV_TYPE_POINTER;
+  indev_drv.read_cb = my_touchpad_read;
+  lv_indev_drv_register(&indev_drv);
+
+  // ========== 加载 GUI-Guider 生成的 UI ==========
+  setup_ui(&guider_ui);
+  events_init(&guider_ui);
+  lv_scr_load(guider_ui.screen); // 加载主屏幕
+
+  while (1)
+  {
+    SensorData_t latest; // 传感器数据结构体
+    if (xQueueReceive(ui_queue, &latest, 0) == pdTRUE)
+    {
+      // 更新温度仪表盘（假设你有一个仪表盘指针对象）
+      lv_meter_set_indicator_value(guider_ui.screen_1_meter_1,
+                                   guider_ui.screen_1_meter_1_scale_0_ndline_0,
+                                   latest.temperature);
+
+      lv_meter_set_indicator_value(guider_ui.screen_2_meter_1,
+                                   guider_ui.screen_2_meter_1_scale_0_ndline_0,
+                                   latest.humidity);
+
+      lv_meter_set_indicator_value(guider_ui.screen_3_meter_1,
+                                   guider_ui.screen_3_meter_1_scale_0_ndline_0,
+                                   latest.bmp_pressure);
+    }
+
+    lv_timer_handler(); // 处理 LVGL 任务
+    vTaskDelay(pdMS_TO_TICKS(5)); // 每5ms更新一次UI
+  }
+}
+
+
 void setup() {
   Serial.begin(115200);
   while(!Serial) delay(10);
@@ -340,19 +489,21 @@ void setup() {
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN); // 初始化I2C总线
 
-  // 1. 初始化串口互斥锁
+  // 初始化串口互斥锁
   serial_mutex = xSemaphoreCreateMutex();
-
-  // 2. 初始化I2C总线互斥锁
+  // 初始化I2C总线互斥锁
   i2c_mutex = xSemaphoreCreateMutex();
+  // 初始化WiFi互斥锁
+  wifi_mutex = xSemaphoreCreateMutex();
 
-  // 3. 创建传感器数据队列
+  // 创建传感器数据队列
   data_queue = xQueueCreate(10, sizeof(SensorData_t));
-  
-  // 4. 连接WiFi
+  // 创建lvgls数据队列
+  ui_queue = xQueueCreate(1, sizeof(SensorData_t));
+
   wifi_connect();
-  
-  // 2. 创建 sensor 任务
+
+  // 创建 sensor 任务
   xTaskCreate(
       sensor_task,   // 任务函数
       "Sensor_Task", // 任务名称
@@ -377,7 +528,17 @@ void setup() {
       4096,       // 栈大小
       NULL,       // 参数
       7,          // 优先级
-      NULL);      // 句柄
+      NULL        // 句柄
+  );
+
+  xTaskCreate(
+      ui_lvgl_task,   // 任务函数
+      "UI_LVGL_Task", // 任务名称
+      8192,           // 栈大小
+      NULL,           // 参数
+      6,              // 优先级
+      NULL            // 句柄
+  );
 }
 
 void loop() {
